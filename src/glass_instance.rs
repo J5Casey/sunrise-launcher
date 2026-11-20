@@ -50,9 +50,28 @@ impl Launcher {
         channel.following(self.game_releases())
     }
 
-    /// The Stable channel's builds, newest first (none until the release list is here).
-    pub(super) fn stable_builds(&self) -> impl Iterator<Item = &Release> {
-        Channel::Stable.builds(self.game_releases())
+    /// Stable can follow an installed build even when its release feed is unavailable.
+    pub(super) fn stable_available(&self) -> bool {
+        Channel::Stable.newest_installed(&self.installed).is_some()
+            || Channel::Stable
+                .builds(self.game_releases())
+                .next()
+                .is_some()
+    }
+
+    /// For a Stable profile, exact choices come from both the catalogue and the player's disk.
+    pub(super) fn stable_choices(&self) -> Vec<String> {
+        let mut tags: Vec<_> = Channel::Stable
+            .builds(self.game_releases())
+            .map(|r| r.tag.clone())
+            .collect();
+        for tag in &self.installed {
+            if Channel::of_build(tag) == Some(Channel::Stable) && !tags.contains(tag) {
+                tags.push(tag.clone());
+            }
+        }
+        tags.sort_by(|a, b| backend::compare_game_versions(b, a));
+        tags
     }
 
     /// The Sunrise versions the dialog offers (the mockup's `data.nightlies`): see
@@ -102,10 +121,7 @@ pub(super) fn sunrise_choices(releases: &[Release], installed: &[String]) -> Vec
 }
 
 impl Launcher {
-    /// A version as a player reads it: the Versions page's name for a build of the game ("Nov 13
-    /// update", with its time when another came out that day; its commit stays in the details),
-    /// "Imported · 2026-10-30", a developer build's name, or the tag. Players who don't know what
-    /// a nightly is see the day it came out, not the channel's jargon.
+    /// The channel and version, or a local build’s name.
     pub(super) fn version_label(&self, tag: &str) -> String {
         if let Some(developer) = sunrise_launcher::developer_install::label(tag) {
             return developer;
@@ -120,10 +136,7 @@ impl Launcher {
                 None => tr("A build with your mods").to_string(),
             };
         }
-        match sunrise_launcher::nightly::date_of(tag) {
-            Some(_) => self.version_name(tag),
-            None => build_import::label(tag).unwrap_or_else(|| tag.to_string()),
-        }
+        build_import::label(tag).unwrap_or_else(|| crate::sheets::build_name(tag))
     }
 }
 

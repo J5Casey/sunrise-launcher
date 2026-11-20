@@ -84,14 +84,12 @@ fn month(year_month: &str) -> String {
 }
 
 fn build(tag: &str, day: &str, installed: bool) -> Build {
-    let nightly = sunrise_launcher::nightly::date_of(tag).is_some();
     Build {
         tag: tag.to_owned(),
         name: build_name(tag),
-        about: match sunrise_launcher::nightly::label(tag) {
-            Some(label) if nightly => label,
-            _ => day.to_owned(),
-        },
+        about: sunrise_launcher::nightly::date_of(tag)
+            .and_then(|_| tag.splitn(5, '-').nth(4))
+            .map_or_else(|| day.to_owned(), sunrise_launcher::nightly::short_commit),
         installed,
     }
 }
@@ -129,7 +127,7 @@ fn lines(
     have.sort_by(|a, b| {
         (Some(b.as_str()) == current)
             .cmp(&(Some(a.as_str()) == current))
-            .then_with(|| sunrise_launcher::backend::compare_versions(b, a))
+            .then_with(|| sunrise_launcher::backend::compare_game_versions(b, a))
     });
     let have: Vec<Line> = have
         .into_iter()
@@ -141,27 +139,28 @@ fn lines(
         out.push(Line::Head(tr("Installed").to_string()));
         out.extend(have);
     }
-    // A Nightly can be listed under two names that install as one version: it is one build.
-    let mut seen = std::collections::HashSet::new();
     for (channel, title) in [
-        (Some(Channel::Nightly), tr("Nightly")),
-        (Some(Channel::Stable), tr("Stable")),
-        (None, tr("Pre-release")),
+        (Channel::Nightly, tr("Nightly")),
+        (Channel::Stable, tr("Stable")),
     ] {
         let mut heading = String::new();
         for r in releases.iter().filter(|r| {
             r.asset.is_some()
-                && Channel::of_release(r) == channel
-                && (channel.is_some() || backend::is_game_tag(&r.tag))
+                && Channel::of_release(r) == Some(channel)
                 && !installed.contains(&r.tag)
-                && seen.insert(r.tag.as_str())
         }) {
             let day = day_of(&r.tag);
             let b = build(&r.tag, &day, false);
             if !wanted(&b, &day) {
                 continue;
             }
-            let under = format!("{title} · {}", month(day.get(..7).unwrap_or(&day)));
+            let under = trf(
+                "{channel} · {month}",
+                &[
+                    ("channel", title),
+                    ("month", &month(day.get(..7).unwrap_or(&day))),
+                ],
+            );
             if under != heading {
                 out.push(Line::Head(under.clone()));
                 heading = under;
@@ -536,39 +535,31 @@ mod tests {
     }
 
     #[test]
-    fn a_rolling_nightly_and_an_old_prerelease_never_have_a_stable_heading() {
+    fn only_current_nightly_and_stable_builds_have_published_rows() {
         let mut releases = vec![
             release("nightly-2026-11-17-aaaaaaa", "2026-11-17", true),
             Release {
                 prerelease: true,
-                ..release("v1.1.0", "2026-11-16", false)
+                ..release("26.3-0.1.1", "2026-11-16", false)
             },
         ];
         assert_eq!(
             shape(&lines(&releases, &[], None, "")),
-            [
-                "# Nightly · November 2026",
-                "nightly-2026-11-17-aaaaaaa",
-                "# Pre-release · November 2026",
-                "v1.1.0",
-            ]
+            ["# Nightly · November 2026", "nightly-2026-11-17-aaaaaaa",]
         );
-        releases.push(release("v1.0.0", "2026-10-01", false));
+        releases.push(release("26.3-0.1.0", "2026-10-01", false));
         assert_eq!(
-            shape(&lines(&releases, &[], None, "v1.0.0")),
-            ["# Stable · October 2026", "v1.0.0"]
+            shape(&lines(&releases, &[], None, "26.3-0.1.0")),
+            ["# Stable · October 2026", "26.3-0.1.0"]
         );
     }
 
     #[test]
     fn installed_builds_lead_then_the_rest_by_channel_and_month() {
         let releases = [
-            release("nightly-2026-11-17-aaaaaaa", "2026-11-17", true),
-            release("nightly-2026-11-16-bbbbbbb", "2026-11-16", true),
             release("nightly-2026-10-30-ccccccc", "2026-10-30", true),
-            // Listed a second time under its dated name.
-            release("nightly-2026-10-30-ccccccc", "2026-10-30", true),
-            release("v1.0.0", "2026-10-01", false),
+            release("v2026.10.13", "2026-10-13", false),
+            release("26.3-0.1.0", "2026-10-01", false),
         ];
         let installed = [
             "nightly-2026-11-17-aaaaaaa".to_owned(),
@@ -590,7 +581,7 @@ mod tests {
                 "# Nightly · October 2026",
                 "nightly-2026-10-30-ccccccc",
                 "# Stable · October 2026",
-                "v1.0.0",
+                "26.3-0.1.0",
             ]
         );
         // A commit or a day finds its build; a heading with nothing under it is gone.
