@@ -11,17 +11,10 @@ impl Launcher {
     /// The Sunrise version an instance plays: the one it keeps, else the one it follows.
     pub(super) fn draft_sunrise(&self) -> Option<String> {
         let d = self.instances.dialog.as_ref()?;
-        d.pin.clone().or_else(|| self.followed_version(d.channel))
+        self.target_version(d.pin.as_ref(), d.channel).cloned()
     }
 
-    /// Create installs the newest Stable build. Nightly uses the same target as Play.
-    fn followed_version(&self, channel: Channel) -> Option<String> {
-        match self.followed_channel(channel) {
-            Channel::Stable => self.stable_builds().next().map(|b| b.tag.clone()),
-            Channel::Nightly => self.target_version(None, Channel::Nightly).cloned(),
-        }
-    }
-
+    /// The exact build the profile will play, including an explicit pin.
     pub(super) fn target_version<'a>(
         &'a self,
         pin: Option<&'a String>,
@@ -41,6 +34,15 @@ impl Launcher {
             Load::Ready(releases) => releases,
             _ => &[],
         }
+    }
+
+    /// Resolve against the profile selected now, not one captured by a background release check.
+    pub(crate) fn game_update(&self) -> Option<&Release> {
+        let profile = self.selected_instance()?;
+        if profile.version.is_some() {
+            return None;
+        }
+        backend::sunrise_update(self.game_releases(), &self.installed, profile.channel)
     }
 
     /// The channel the profile actually follows, without changing its saved preference.
@@ -80,21 +82,7 @@ fn profile_target<'a>(
     installed: &'a [String],
     launcher_version: Option<&'a String>,
 ) -> Option<&'a String> {
-    pin.or_else(|| match channel.following(releases) {
-        Channel::Stable => {
-            // Keep the existing policy: prefer an installed Stable build.
-            Channel::Stable
-                .builds(releases)
-                .find(|r| installed.contains(&r.tag))
-                .or_else(|| Channel::Stable.builds(releases).next())
-                .map(|r| &r.tag)
-        }
-        Channel::Nightly => Channel::Nightly
-            .builds(releases)
-            .next()
-            .map(|r| &r.tag)
-            .or(launcher_version),
-    })
+    pin.or_else(|| channel.play_target(releases, installed, launcher_version))
 }
 
 /// Every Nightly published with a build for this platform, newest first, then the installed
@@ -159,7 +147,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nightly_follows_the_newest_download_for_this_platform_then_falls_back_offline() {
+    fn play_keeps_the_installed_nightly_until_an_explicit_update() {
         let old = "nightly-2026-11-16-aaaaaaa".to_owned();
         let latest = "nightly-2026-11-18-ccccccc";
         let releases = [
@@ -171,7 +159,11 @@ mod tests {
         let target = |releases: &[Release]| {
             profile_target(None, Channel::Nightly, releases, &installed, Some(&old)).cloned()
         };
-        assert_eq!(target(&releases).as_deref(), Some(latest));
+        assert_eq!(target(&releases), Some(old.clone()));
+        assert_eq!(
+            profile_target(None, Channel::Nightly, &releases, &[], None).map(String::as_str),
+            Some(latest)
+        );
         assert_eq!(target(&[]), Some(old));
     }
 
@@ -214,24 +206,25 @@ mod tests {
             release("nightly-2026-11-17-aaaaaaa", true, true),
             Release {
                 prerelease: true,
-                ..release("v1.1.0", false, true)
+                ..release("26.3-0.1.2", false, true)
             },
             Release {
                 prerelease: true,
+                nightly: Some("nightly-2026-11-16".into()),
                 ..release("nightly-2026-11-16-bbbbbbb", true, true)
             },
         ];
         assert!(Channel::Stable.builds(&releases).next().is_none());
-        assert_eq!(Channel::Nightly.builds(&releases).count(), 3);
+        assert_eq!(Channel::Nightly.builds(&releases).count(), 1);
 
-        releases.push(release("v1.0.1", false, false));
-        releases.push(release("v1.0.0", false, true));
+        releases.push(release("26.3-0.1.1", false, false));
+        releases.push(release("26.3-0.1.0", false, true));
         assert_eq!(
             Channel::Stable
                 .builds(&releases)
                 .map(|r| r.tag.as_str())
                 .collect::<Vec<_>>(),
-            ["v1.0.0"]
+            ["26.3-0.1.0"]
         );
     }
 
@@ -240,10 +233,9 @@ mod tests {
         let stable = Channel::Stable;
         let mut releases = vec![
             release("nightly-2026-11-17-aaaaaaa", true, true),
-            release("nightly-2026-11-16-bbbbbbb", true, true),
             Release {
                 prerelease: true,
-                ..release("v1.1.0", false, true)
+                ..release("26.3-0.1.2", false, true)
             },
         ];
         let plays = |releases: &[Release]| {
@@ -257,19 +249,16 @@ mod tests {
             plays(&releases).as_deref(),
             Some("nightly-2026-11-17-aaaaaaa")
         );
-        releases.push(release("v1.0.0", false, true));
-        assert_eq!(plays(&releases).as_deref(), Some("v1.0.0"));
+        releases.push(release("26.3-0.1.0", false, true));
+        assert_eq!(plays(&releases).as_deref(), Some("26.3-0.1.0"));
     }
 
     #[test]
-    fn the_dialog_offers_every_published_nightly_then_what_only_this_computer_has() {
+    fn the_dialog_offers_the_current_nightly_then_installed_builds() {
         let releases = [
             release("nightly-2026-11-03-aaaaaaa", true, true),
-            // No build for this platform: nothing to install.
-            release("nightly-2026-11-02-bbbbbbb", true, false),
-            release("nightly-2026-11-01-ccccccc", true, true),
-            // The old Alpha channel's releases aren't Nightlies.
-            release("v0.2.1", false, true),
+            // Stable has its own publication channel.
+            release("26.3-0.1.0", false, true),
         ];
         let installed = [
             "nightly-2026-11-01-ccccccc".to_string(),

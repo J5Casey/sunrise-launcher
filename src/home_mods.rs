@@ -321,7 +321,10 @@ fn read_changed(query: &Query, known: &str) -> Option<(String, Snapshot)> {
     let update_check = build
         .as_ref()
         .zip(query.newest.as_deref())
-        .filter(|(build, next)| backend::compare_versions(next, &build.base).is_gt())
+        .filter(|(build, next)| {
+            instances::Channel::of_build(&build.base) == instances::Channel::of_build(next)
+                && backend::compare_game_versions(next, &build.base).is_gt()
+        })
         .filter(|_| !native_status::enabled(&query.home).is_empty())
         .map(|(_, next)| crate::sheets::check_key(&query.home, next));
     let left_out = match build {
@@ -481,7 +484,10 @@ impl Launcher {
         let query = Query {
             home: instance.home.clone(),
             version: self.version_of(instance).cloned(),
-            newest: native_mods::newest_installed(&self.installed).cloned(),
+            newest: self
+                .followed_channel(instance.channel)
+                .newest_installed(&self.installed)
+                .cloned(),
         };
         let mods = &mut self.ui.home.mods;
         if mods.query.as_ref() != Some(&query) {

@@ -200,9 +200,6 @@ impl Launcher {
                                     eprintln!("Could not mark updated Nightly {tag}: {e}");
                                 }
                             }
-                            if self.updates.sunrise.as_ref().is_some_and(|r| r.tag == tag) {
-                                self.updates.sunrise = None;
-                            }
                             // An instance's own version leaves the other instances on theirs.
                             // Judged now, not when the download started: a version picked on
                             // Versions meanwhile stays picked.
@@ -216,6 +213,7 @@ impl Launcher {
                                 backend::select_after_update(
                                     self.settings.selected.as_deref(),
                                     &before,
+                                    &tag,
                                 )
                             }) && (!for_instance || self.launcher_version().is_none());
                             if select {
@@ -277,9 +275,6 @@ impl Launcher {
                         settings::log_launcher_check_failure(error, |line| eprintln!("{line}"));
                     }
                     self.updates = *updates;
-                    if self.settings.auto_install() {
-                        self.install_update();
-                    }
                     if let Some(release) = self.updates.launcher.clone() {
                         self.update_launcher(release);
                     }

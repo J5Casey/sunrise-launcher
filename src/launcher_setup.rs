@@ -447,10 +447,7 @@ impl Launcher {
 
     /// Installs the Sunrise version the last check found, keeping the player's choice of
     /// version unless they were on the newest one.
-    pub(crate) fn install_update(&mut self) {
-        let Some(release) = self.updates.sunrise.clone() else {
-            return;
-        };
+    pub(crate) fn install_update(&mut self, release: Release) {
         if self.installing.is_some() || self.removing.contains(&release.tag) {
             return;
         }

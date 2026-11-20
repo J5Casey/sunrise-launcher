@@ -781,3 +781,99 @@ fn artwork_reader_does_not_wait_for_a_pipe_writer() {
     assert_eq!(read_artwork(&path), None);
     fs::remove_dir_all(&root).unwrap();
 }
+
+#[test]
+fn first_profile_is_stable_without_migrating_old_players() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fresh = tmp.path().join("fresh");
+    let home = tmp.path().join("game");
+    initialize_default_in(&home, &fresh).unwrap();
+    assert_eq!(list_in(&home, &fresh)[0].channel, Channel::Stable);
+    fs::write(fresh.join("settings.json"), "{}").unwrap();
+    initialize_default_in(&home, &fresh).unwrap();
+    assert_eq!(list_in(&home, &fresh)[0].channel, Channel::Stable);
+
+    let existing = tmp.path().join("existing");
+    fs::create_dir_all(&existing).unwrap();
+    let old = br#"{"instances":{"sunrise":{"version":"v2026.10.13"}}}"#;
+    fs::write(existing.join(FILE), old).unwrap();
+    initialize_default_in(&home, &existing).unwrap();
+    assert_eq!(fs::read(existing.join(FILE)).unwrap(), old);
+    let profile = &list_in(&home, &existing)[0];
+    assert_eq!(profile.channel, Channel::Nightly);
+    assert_eq!(profile.version.as_deref(), Some("v2026.10.13"));
+
+    fs::remove_file(existing.join(FILE)).unwrap();
+    fs::write(existing.join("settings.json"), "{}").unwrap();
+    initialize_default_in(&home, &existing).unwrap();
+    assert_eq!(list_in(&home, &existing)[0].channel, Channel::Nightly);
+    assert!(!existing.join(FILE).exists());
+
+    // Playing on the implicit profile could leave only the game files.
+    fs::remove_file(existing.join("settings.json")).unwrap();
+    fs::create_dir_all(home.join("saves")).unwrap();
+    initialize_default_in(&home, &existing).unwrap();
+    assert_eq!(list_in(&home, &existing)[0].channel, Channel::Nightly);
+    assert!(!existing.join(FILE).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn an_installed_legacy_pin_still_starts_its_client() {
+    use std::os::unix::fs::PermissionsExt;
+    const ACTOR: &str = "SUNRISE_STABLE_LEGACY_PLAY_TEST";
+    const OLD: &str = "v2026.10.13";
+    const UUID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    if std::env::var_os(ACTOR).is_none() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "instances::tests::an_installed_legacy_pin_still_starts_its_client"
+            ])
+            .env(ACTOR, "1")
+            .env("SUNRISE_LAUNCHER_HOME", root.path().join("launcher"))
+            .env("SUNRISE_HOME", root.path().join("game"))
+            .env("SUNRISE_TELEMETRY_URL", "off")
+            .env("SUNRISE_NO_KEYCHAIN", "1")
+            .status()
+            .unwrap()
+            .success());
+        return;
+    }
+    let data = backend::data_dir();
+    fs::create_dir_all(backend::version_dir("26.3-0.1.0")).unwrap();
+    fs::write(backend::version_dir("26.3-0.1.0").join(".installed"), "").unwrap();
+    fs::create_dir_all(backend::resources(OLD)).unwrap();
+    fs::write(backend::version_dir(OLD).join(".installed"), "").unwrap();
+    fs::write(backend::resources(OLD).join("sunrise-resources.json"), "{}").unwrap();
+    fs::write(
+        data.join(FILE),
+        format!(r#"{{"instances":{{"sunrise":{{"version":"{OLD}"}}}}}}"#),
+    )
+    .unwrap();
+    let client = backend::client_program(OLD);
+    fs::write(&client, "#!/bin/sh\nprintf 'legacy client reached\\n'\n").unwrap();
+    fs::set_permissions(&client, fs::Permissions::from_mode(0o700)).unwrap();
+
+    // Local stand-in for an already authenticated session; no service is contacted.
+    let accounts =
+        serde_json::json!({"selected": UUID, "accounts": [{"uuid": UUID, "name": "Player"}]});
+    fs::write(data.join("accounts.json"), accounts.to_string()).unwrap();
+    let secrets = serde_json::json!({"refresh_token":"fixture", "minecraft_token":"fixture",
+        "minecraft_expires_at":SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 3600});
+    crate::account::store()
+        .set(UUID, &secrets.to_string())
+        .unwrap();
+
+    assert!(!backend::is_game_tag(OLD));
+    let instance = selection().unwrap();
+    let tag = instance.resolve_version(None).unwrap();
+    assert_eq!(tag, OLD);
+    let mut cmd = backend::client_as(&tag, None).unwrap();
+    apply(&mut cmd, &instance).unwrap();
+    let result = cmd.output().unwrap();
+    assert!(result.status.success(), "{result:?}");
+    assert_eq!(result.stdout, b"legacy client reached\n");
+    crate::account::discard_unread_sessions();
+}

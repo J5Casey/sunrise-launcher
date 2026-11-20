@@ -590,14 +590,14 @@ mod tests {
     fn the_base_is_the_selected_release_or_the_newest_one() {
         let installed = [
             "nightly-2026-11-01-c9d474d".to_string(),
-            "v0.2.95".to_string(),
+            "26.3-0.1.0".to_string(),
             "native-c9d474d-0123456789ab".to_string(),
             "imported-2026-10-31-abcdef0".to_string(),
         ];
         let newest = Ok("nightly-2026-11-01-c9d474d".to_string());
         assert_eq!(
-            base_for(&installed, None, Some("v0.2.95")),
-            Ok("v0.2.95".to_string())
+            base_for(&installed, None, Some("26.3-0.1.0")),
+            Ok("26.3-0.1.0".to_string())
         );
         for selected in [None, Some("imported-2026-10-31-abcdef0"), Some("v0.1.0")] {
             assert_eq!(base_for(&installed, None, selected), newest);
@@ -618,7 +618,7 @@ mod tests {
         mixed.insert(0, developer.to_string());
         assert_eq!(base_for(&mixed, None, None), newest);
         // --version can explicitly name a developer base, but not an imported or native derivative.
-        let asked = |b| base_for(&installed, Some(b), Some("v0.2.95"));
+        let asked = |b| base_for(&installed, Some(b), Some("26.3-0.1.0"));
         assert_eq!(asked("nightly-2026-11-01-c9d474d"), newest);
         for b in [
             "v0.1.0",

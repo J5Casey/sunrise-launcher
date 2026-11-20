@@ -350,37 +350,6 @@ fn installed_architecture_matches(
     installed.requested == target || installed.binary == target
 }
 
-fn game_architecture_install_needed(
-    target: GameArchitecture,
-    expected: GameArchitecture,
-    installed: Option<InstalledGameArchitecture>,
-) -> bool {
-    installed.is_none_or(|installed| {
-        (installed.requested != target && installed.binary != target)
-            || installed.binary != expected
-    })
-}
-
-/// Whether an installed version needs the selected architecture downloaded. This also refreshes
-/// old installs with a same-version install when needed to record an ARM64 fallback choice.
-pub fn needs_game_architecture_install(tag: &str, release: &Release) -> bool {
-    if !can_choose_game_architecture() {
-        return false;
-    }
-    let Some(expected) = release
-        .asset
-        .as_ref()
-        .and_then(|(url, _)| architecture_for_asset(url))
-    else {
-        return false;
-    };
-    let settings = Settings::load();
-    let Some(target) = selected_game_architecture(&settings) else {
-        return false;
-    };
-    game_architecture_install_needed(target, expected, installed_game_architecture(tag))
-}
-
 fn native_mod_architecture_message(
     process: GameArchitecture,
     selected: GameArchitecture,
@@ -518,11 +487,8 @@ pub(crate) fn get_unless_missing(url: &str) -> Result<Option<ureq::Response>, St
     }
 }
 
-/// A Sunrise game tag: `v` then a digit (`v2026.10.13`); a launcher `vX.Y.Z` matches too, but only the game repository's list is checked, and its launcher releases are `launcher@X.Y.Z`.
-pub fn is_game_tag(tag: &str) -> bool {
-    tag.strip_prefix('v')
-        .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
-}
+mod game_tags;
+pub use game_tags::{compare_game_versions, is_game_tag, stable_version};
 
 /// The launcher version in a `vX.Y.Z` tag of [`LAUNCHER_REPO`], or None for any other tag: the verifier's own grammar, so discovery never takes a tag it would refuse.
 pub fn launcher_version(tag: &str) -> Option<&str> {
@@ -548,7 +514,7 @@ fn own_tag_of(tag: Option<&str>, injected: Option<&str>) -> String {
     }
 }
 
-/// Where a tag or version stands among Sunrise's releases (docs/versioning.md): the tags from
+/// Launcher version ordering, including historical launcher tags: the tags from
 /// before 0.2 (`vYYYY.MM.DD[.N]`, `launcher-vX.Y.Z`) and bare versions first, compared number by
 /// number with missing parts as zero and anything after a `-` ignored, as launchers always did;
 /// then the 0.2 tags (`vX.Y.Z`, `launcher@X.Y.Z`) in semver's order, a pre-release
@@ -558,9 +524,6 @@ pub enum ReleaseOrder {
     /// Numbers without trailing zeros, so 1.2 and 1.2.0 are equal.
     Before02(Vec<u64>),
     Semver([u64; 3], Prerelease),
-    /// A Nightly (`nightly-<date>-<commit>`), by its date: newer than every release, since the
-    /// Nightly is the only build Sunrise ships.
-    Nightly(String),
 }
 
 /// (is a release, the pre-release's identifiers): a release follows every pre-release of its
@@ -577,9 +540,6 @@ pub enum Identifier {
 const FIRST_YEAR: u64 = 1000;
 
 pub fn release_order(tag: &str) -> ReleaseOrder {
-    if let Some(date) = crate::nightly::date_of(tag) {
-        return ReleaseOrder::Nightly(date.to_owned());
-    }
     // The game repository's launcher tags (`launcher@X.Y.Z`, before that `launcher-vX.Y.Z`) still order among the rest.
     let semver = tag
         .strip_prefix("launcher@")
@@ -652,13 +612,15 @@ fn release_list() -> Result<serde_json::Value, String> {
     .unwrap_or_else(|| serde_json::json!([])))
 }
 
-/// The game's releases in `list` whose tag passes `keep`, newest first, with the asset named `asset`, downloaded from [`GAME_REPO`].
+/// The game's releases in `list` whose tag passes `keep`, with the named asset from [`GAME_REPO`].
 pub(crate) fn parse_releases(
     list: &serde_json::Value,
     asset: Option<&str>,
     keep: fn(&str) -> bool,
 ) -> Vec<Release> {
-    parse_releases_from(list, asset, keep, crate::signed::asset_url)
+    let mut out = parse_releases_from(list, asset, keep, crate::signed::asset_url);
+    out.sort_by(|a, b| compare_game_versions(&b.tag, &a.tag));
+    out
 }
 
 /// This launcher's releases in `list` (from [`LAUNCHER_REPO`]), newest first, with the asset named `asset`, downloaded from there.
@@ -666,12 +628,14 @@ pub(crate) fn parse_launcher_releases(
     list: &serde_json::Value,
     asset: Option<&str>,
 ) -> Vec<Release> {
-    parse_releases_from(
+    let mut out = parse_releases_from(
         list,
         asset,
         is_launcher_tag,
         crate::signed::launcher_asset_url,
-    )
+    );
+    out.sort_by(|a, b| compare_versions(&b.tag, &a.tag));
+    out
 }
 
 fn parse_releases_from(
@@ -710,7 +674,6 @@ fn parse_releases_from(
             nightly: None,
         });
     }
-    out.sort_by(|a, b| compare_versions(&b.tag, &a.tag));
     out
 }
 
@@ -718,9 +681,8 @@ fn is_launcher_tag(tag: &str) -> bool {
     launcher_version(tag).is_some()
 }
 
-/// Published Sunrise builds, newest first: the current Nightly (the only build Sunrise ships since
-/// 2026-10-28, docs/release-flow.md), the last week's Nightlies, then the releases from before.
-/// Drafts never reach the anonymous API, and launcher releases are left out.
+/// Published Sunrise builds: the current Nightly, then Stable builds newest first.
+/// No dated Nightly release, game prerelease or launcher release is offered here.
 pub fn releases() -> Result<Vec<Release>, String> {
     Ok(game_releases(&release_list()?))
 }
@@ -748,7 +710,8 @@ fn game_releases_with(
     asset: Option<&str>,
     fallback: Option<&str>,
 ) -> Vec<Release> {
-    let keep = |tag: &str| is_game_tag(tag) || sunrise_launcher_release_verify::is_nightly(tag);
+    use sunrise_launcher_release_verify::NIGHTLY;
+    let keep = |tag: &str| tag == NIGHTLY || is_game_tag(tag);
     let mut out = parse_releases(list, asset, keep);
     if fallback.is_some() {
         // The same releases in the same order: only the asset looked for differs.
@@ -758,16 +721,15 @@ fn game_releases_with(
             }
         }
     }
+    out.retain(|r| r.tag == NIGHTLY || !r.prerelease);
     for r in &mut out {
-        if sunrise_launcher_release_verify::is_nightly(&r.tag) {
+        if r.tag == NIGHTLY {
             let version = crate::nightly::version_of(r);
             let tag = std::mem::replace(&mut r.tag, version);
-            r.prerelease = tag != sunrise_launcher_release_verify::NIGHTLY;
+            r.prerelease = false;
             r.nightly = Some(tag);
         }
     }
-    // Two Nightlies of one day: the current one first (the dated one is the day's earlier build).
-    out.sort_by(|a, b| compare_versions(&b.tag, &a.tag).then(a.prerelease.cmp(&b.prerelease)));
     out
 }
 
@@ -801,12 +763,6 @@ fn launcher_releases_from(
 /// The newest Sunrise release that has a build for this platform.
 pub fn latest(releases: &[Release]) -> Option<&Release> {
     releases.iter().find(|r| r.asset.is_some())
-}
-
-/// The releases a launcher installs by itself: every one that is published as a release, so
-/// GitHub's latest when it comes out. The pre-releases of the old Alpha channel are left out.
-pub fn installable_updates(releases: &[Release]) -> Vec<Release> {
-    releases.iter().filter(|r| !r.prerelease).cloned().collect()
 }
 
 /// How often a launcher left open looks for new releases: they come out several times a day.
@@ -1106,7 +1062,7 @@ fn installed_in(versions: &Path) -> Vec<String> {
         .filter(|e| e.path().join(COMPLETE).exists())
         .filter_map(|e| e.file_name().into_string().ok())
         .collect();
-    tags.sort_by(|a, b| compare_versions(b, a));
+    tags.sort_by(|a, b| compare_game_versions(b, a).then_with(|| b.cmp(a)));
     tags
 }
 
@@ -3303,16 +3259,23 @@ pub struct Updates {
     pub launcher_error: Option<String>,
 }
 
-/// The newest Sunrise build with a build here (the current Nightly), if it isn't installed and
-/// no installed version is newer. Two Nightlies of one day compare equal: the one on GitHub is
-/// the update.
-pub fn sunrise_update(releases: &[Release], installed: &[String]) -> Option<Release> {
-    let newest = latest(releases)?;
+/// An update stays on the profile's followed channel. Installed builds on another channel
+/// do not suppress it. A new rolling Nightly built the same day is still an update.
+pub fn sunrise_update<'a>(
+    releases: &'a [Release],
+    installed: &[String],
+    channel: crate::instances::Channel,
+) -> Option<&'a Release> {
+    let newest = channel.builds(releases).next()?;
     let newer = !installed.contains(&newest.tag)
-        && installed
-            .iter()
-            .all(|t| compare_versions(&newest.tag, t).is_ge());
-    newer.then(|| newest.clone())
+        && channel.newest_installed(installed).is_none_or(|tag| {
+            let order = compare_game_versions(&newest.tag, tag);
+            match channel {
+                crate::instances::Channel::Stable => order.is_gt(),
+                crate::instances::Channel::Nightly => order.is_ge(),
+            }
+        });
+    newer.then_some(newest)
 }
 
 /// The newest launcher release with an archive for this platform, if newer than this launcher ([`own_tag`]).
@@ -3333,6 +3296,9 @@ pub fn releases_and_updates(on_releases: impl FnOnce(Result<Vec<Release>, String
     releases_and_updates_with(
         release_list,
         installed,
+        crate::instances::selection()
+            .ok()
+            .and_then(|instance| instance.version.is_none().then_some(instance.channel)),
         || launcher_releases(crate::github::CachePolicy::PreferCache),
         on_releases,
     )
@@ -3341,6 +3307,7 @@ pub fn releases_and_updates(on_releases: impl FnOnce(Result<Vec<Release>, String
 fn releases_and_updates_with(
     load: impl FnOnce() -> Result<serde_json::Value, String>,
     installed: impl FnOnce() -> Vec<String>,
+    channel: Option<crate::instances::Channel>,
     launchers: impl FnOnce() -> Result<Vec<Release>, String>,
     on_releases: impl FnOnce(Result<Vec<Release>, String>),
 ) -> Updates {
@@ -3349,8 +3316,9 @@ fn releases_and_updates_with(
         Ok(list) => {
             let releases = game_releases(&list);
             let installed_versions = installed();
-            updates.sunrise = sunrise_update(&installable_updates(&releases), &installed_versions)
-                .or_else(|| architecture_update(&releases, &installed_versions));
+            updates.sunrise = channel
+                .and_then(|c| sunrise_update(&releases, &installed_versions, c))
+                .cloned();
             on_releases(Ok(releases));
         }
         Err(e) => {
@@ -3365,24 +3333,6 @@ fn releases_and_updates_with(
     updates
 }
 
-/// If the selected installed game has the wrong architecture, offer the same release again so
-/// the preference also applies when there is no newer game version.
-fn architecture_update(releases: &[Release], installed: &[String]) -> Option<Release> {
-    if !can_choose_game_architecture() {
-        return None;
-    }
-    let settings = Settings::load();
-    let tag = settings
-        .selected
-        .filter(|tag| installed.contains(tag))
-        .or_else(|| installed.iter().find(|tag| is_game_tag(tag)).cloned())?;
-    if !is_game_tag(&tag) {
-        return None;
-    }
-    let release = releases.iter().find(|release| release.tag == tag)?;
-    needs_game_architecture_install(&tag, release).then(|| release.clone())
-}
-
 /// A fresh release-list request for both kinds of update (plus older-launcher fallback if needed).
 pub fn check_updates() -> Updates {
     releases_and_updates(|_| {})
@@ -3391,14 +3341,16 @@ pub fn check_updates() -> Updates {
 mod update_selection;
 pub use update_selection::select_after_update;
 
-/// Installs `tag` (or with "latest" the newest release, pre-releases left out), then updates the selection as
+/// Installs `tag` (or with "latest", the profile's latest release), then updates the selection as
 /// `select_after_update` says when `as_update`, or always selects it otherwise.
 pub fn install_tag(tag: &str, as_update: bool, progress: impl Fn(f32)) -> Result<String, String> {
     let releases = [releases()?, release_selection::snapshot(tag)?].concat();
     let release = if tag == "latest" {
-        releases
-            .iter()
-            .find(|r| r.asset.is_some() && !r.prerelease)
+        crate::instances::selected()
+            .channel
+            .following(&releases)
+            .builds(&releases)
+            .next()
             .ok_or("No release has a build for this platform yet.")?
     } else {
         release_selection::by_tag(&releases, tag)
@@ -3408,10 +3360,6 @@ pub fn install_tag(tag: &str, as_update: bool, progress: impl Fn(f32)) -> Result
         return Err(format!("{} has no build for this platform.", release.tag));
     }
     let before = installed();
-    let downgrade = nightly_downgrade(release, &before);
-    if let Some(warning) = &downgrade {
-        eprintln!("{warning}");
-    }
     install(release, progress)?;
     if as_update && release.nightly.is_some() {
         if let Err(e) = mark_auto_installed(&release.tag) {
@@ -3419,9 +3367,8 @@ pub fn install_tag(tag: &str, as_update: bool, progress: impl Fn(f32)) -> Result
         }
     }
     let mut settings = Settings::load();
-    // An older Nightly is a deliberate rollback: installed, but an update never moves the selection back.
-    let select = !as_update
-        || (downgrade.is_none() && select_after_update(settings.selected.as_deref(), &before));
+    let select =
+        !as_update || select_after_update(settings.selected.as_deref(), &before, &release.tag);
     if select {
         settings.selected = Some(release.tag.clone());
         settings.save()?;
@@ -3431,24 +3378,6 @@ pub fn install_tag(tag: &str, as_update: bool, progress: impl Fn(f32)) -> Result
     }
     prune_old_versions();
     Ok(release.tag.clone())
-}
-
-/// A warning when `release` is a Nightly older than a Nightly already installed: a rollback, which is
-/// allowed, but never what an update should do silently (an older build served as the current one
-/// shows its own date, since that date is signed). None otherwise.
-pub fn nightly_downgrade(release: &Release, installed: &[String]) -> Option<String> {
-    release.nightly.as_ref()?;
-    let newest = installed
-        .iter()
-        .filter(|v| crate::nightly::date_of(v).is_some())
-        .max_by(|a, b| compare_versions(a, b))?;
-    compare_versions(&release.tag, newest).is_lt().then(|| {
-        crate::i18n::trf(
-            "{tag} is older than {newest}, which is installed: installing it as a rollback. The selection \
-             only moves to it when you pick it.",
-            &[("tag", &release.tag), ("newest", newest)],
-        )
-    })
 }
 
 /// The launcher's own path, read once at start: after a self-update the running file is gone.
@@ -4354,10 +4283,6 @@ pub struct Settings {
     pub instance: Option<String>,
     pub minecraft_dir: Option<PathBuf>,
     pub server_dir: Option<PathBuf>,
-    /// Unset means on: only a player who turned it off has `false` here. 0.1.1 wrote its
-    /// `auto_install` (off by default) for everyone, so this is a new key and that one is ignored.
-    #[serde(default)]
-    pub install_new_versions: Option<bool>,
     /// Unset means on: after an install the launcher deletes the release versions nothing needs
     /// (`prune_old_versions`). Only a player who turned it off has `false` here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4616,10 +4541,6 @@ impl Settings {
     /// The window's language: the one picked, else the system's.
     pub fn language(&self) -> crate::i18n::Language {
         self.language.unwrap_or_else(crate::i18n::Language::system)
-    }
-    /// Whether new Sunrise versions are installed automatically.
-    pub fn auto_install(&self) -> bool {
-        self.install_new_versions.unwrap_or(true)
     }
     /// Whether old versions are deleted after an install.
     pub fn auto_prune(&self) -> bool {
@@ -5386,26 +5307,27 @@ pub fn {f}("
              "published_at": "2026-11-13T10:00:00Z", "assets": asset(SNAPSHOT)},
             {"tag_name": "nightly", "name": "Nightly 2026-11-12 · aaaaaaa", "prerelease": true,
              "published_at": "2026-11-12T10:00:00Z", "assets": asset("nightly")},
-            {"tag_name": "v0.2.81", "name": "v0.2.81", "published_at": "2026-10-01T10:00:00Z",
-             "assets": asset("v0.2.81")},
+            {"tag_name": "26.3-0.1.81", "name": "26.3-0.1.81", "published_at": "2026-10-01T10:00:00Z",
+             "assets": asset("26.3-0.1.81")},
         ]);
         let releases = game_releases_with(&list, Some(zip), None);
         assert_eq!(
             releases.iter().map(|r| r.tag.as_str()).collect::<Vec<_>>(),
-            ["nightly-2026-11-12-aaaaaaa", "v0.2.81"]
+            ["nightly-2026-11-12-aaaaaaa", "26.3-0.1.81"]
         );
         for installed in [vec![], vec![SNAPSHOT.to_owned()]] {
-            let update = sunrise_update(&releases, &installed).unwrap();
+            let update =
+                sunrise_update(&releases, &installed, crate::instances::Channel::Nightly).unwrap();
             assert_eq!(update.tag, "nightly-2026-11-12-aaaaaaa", "{installed:?}");
         }
         // A snapshot the developer selected stays selected when that Nightly installs as an
         // update, whether it is the only version installed or beside a release.
         for installed in [
             vec![SNAPSHOT.to_owned()],
-            vec![SNAPSHOT.to_owned(), "v0.2.81".into()],
+            vec![SNAPSHOT.to_owned(), "26.3-0.1.81".into()],
         ] {
             assert!(
-                !select_after_update(Some(SNAPSHOT), &installed),
+                !select_after_update(Some(SNAPSHOT), &installed, "nightly-2026-11-12-aaaaaaa"),
                 "{installed:?}"
             );
         }
@@ -5419,12 +5341,12 @@ pub fn {f}("
         let (arm, x64) = ("sunrise-windows-arm64.zip", "sunrise-windows-x64.zip");
         let asset = |name: &str, url: &str| serde_json::json!({"name": name, "browser_download_url": url, "size": 1});
         let list = serde_json::json!([
-            {"tag_name": "v2026.11.05", "assets": [
+            {"tag_name": "26.3-0.1.5", "assets": [
                 asset(x64, "https://example.test/v2026.11.05/sunrise-windows-x64.zip"),
                 asset(arm, "https://example.test/v2026.11.05/sunrise-windows-arm64.zip")]},
-            {"tag_name": "v2026.11.04", "assets": [
+            {"tag_name": "26.3-0.1.4", "assets": [
                 asset(x64, "https://example.test/v2026.11.04/sunrise-windows-x64.zip")]},
-            {"tag_name": "v2026.11.03", "assets": []},
+            {"tag_name": "26.3-0.1.3", "assets": []},
         ]);
         let releases = game_releases_with(&list, Some(arm), Some(x64));
         let urls: Vec<_> = releases
@@ -5539,9 +5461,9 @@ pub fn {f}("
         let x64 = "sunrise-windows-x64.zip";
         let asset = |name: &str| serde_json::json!({"name": name, "browser_download_url": format!("https://example.test/{name}"), "size": 1});
         let list = serde_json::json!([
-            {"tag_name": "v2026.11.05", "assets": [asset(x64), asset(arm)]},
-            {"tag_name": "v2026.11.04", "assets": [asset(x64)]},
-            {"tag_name": "v2026.11.03", "assets": []}
+            {"tag_name": "26.3-0.1.5", "assets": [asset(x64), asset(arm)]},
+            {"tag_name": "26.3-0.1.4", "assets": [asset(x64)]},
+            {"tag_name": "26.3-0.1.3", "assets": []}
         ]);
 
         let arm_choice = game_releases_with(&list, Some(arm), Some(x64));
@@ -5610,43 +5532,6 @@ pub fn {f}("
                 requested: GameArchitecture::X64,
                 binary: GameArchitecture::X64,
             }
-        ));
-    }
-
-    #[test]
-    fn updates_reinstall_only_when_the_selected_game_architecture_needs_a_new_build() {
-        let arm_fallback = InstalledGameArchitecture {
-            requested: GameArchitecture::Arm64,
-            binary: GameArchitecture::X64,
-        };
-        let old_x64 = InstalledGameArchitecture {
-            requested: GameArchitecture::X64,
-            binary: GameArchitecture::X64,
-        };
-        let arm = InstalledGameArchitecture {
-            requested: GameArchitecture::Arm64,
-            binary: GameArchitecture::Arm64,
-        };
-
-        assert!(!game_architecture_install_needed(
-            GameArchitecture::Arm64,
-            GameArchitecture::X64,
-            Some(arm_fallback),
-        ));
-        assert!(game_architecture_install_needed(
-            GameArchitecture::Arm64,
-            GameArchitecture::X64,
-            Some(old_x64),
-        ));
-        assert!(game_architecture_install_needed(
-            GameArchitecture::Arm64,
-            GameArchitecture::Arm64,
-            Some(arm_fallback),
-        ));
-        assert!(!game_architecture_install_needed(
-            GameArchitecture::Arm64,
-            GameArchitecture::Arm64,
-            Some(arm),
         ));
     }
 
@@ -5832,26 +5717,11 @@ pub fn {f}("
     }
 
     #[test]
-    fn tags_never_mix() {
-        assert!(is_game_tag("v2026.10.13"));
-        assert!(is_game_tag("v0.2.0"));
-        assert!(!is_game_tag("launcher@1.0.0"));
-        assert!(!is_game_tag("vnext"));
+    fn launcher_tags_keep_their_original_grammar() {
         assert_eq!(launcher_version("v1.2.0"), Some("1.2.0"));
         assert_eq!(launcher_version("vnext"), None);
         assert_eq!(launcher_version("launcher@1.0.0"), None);
-        // Each list comes from its own repository: the game's still carries `launcher@1.0.0`, never a game release.
-        let file = |name: &str| serde_json::json!([{"name": name, "browser_download_url": "u", "size": 1}]);
-        let game_list = serde_json::json!([
-            {"tag_name": "v2026.10.12", "assets": file("sunrise-linux-x86_64.tar.gz")},
-            {"tag_name": "launcher@1.0.0", "assets": file("sunrise-launcher-linux-x86_64.tar.gz")},
-            {"tag_name": "v2026.10.13", "assets": []},
-        ]);
-        let game: Vec<_> = parse_releases(&game_list, ASSET, is_game_tag)
-            .into_iter()
-            .map(|r| r.tag)
-            .collect();
-        assert_eq!(game, ["v2026.10.13", "v2026.10.12"]);
+        let file = |name: &str| serde_json::json!([{"name": name, "size": 1}]);
         let launcher_list = serde_json::json!([
             {"tag_name": "v1.1.0", "assets": file("sunrise-launcher-linux-x86_64.tar.gz")},
             {"tag_name": "v1.0.9", "draft": true, "assets": []},
@@ -5869,55 +5739,25 @@ pub fn {f}("
     fn withdrawn_release_is_never_offered() {
         let asset = ASSET.unwrap_or("sunrise-linux-x86_64.tar.gz");
         let list = serde_json::json!([
-            {"tag_name": "v2026.10.15.1", "draft": true, "assets": [{"name": asset, "browser_download_url": "bad", "size": 1}]},
-            {"tag_name": "v2026.10.15", "assets": [{"name": asset, "browser_download_url": "good", "size": 1}]},
-            {"tag_name": "v2026.10.14", "assets": [{"name": asset, "browser_download_url": "old", "size": 1}]},
+            {"tag_name": "26.3-0.1.2", "draft": true, "assets": [{"name": asset, "browser_download_url": "bad", "size": 1}]},
+            {"tag_name": "26.3-0.1.1", "assets": [{"name": asset, "browser_download_url": "good", "size": 1}]},
+            {"tag_name": "26.3-0.1.0", "assets": [{"name": asset, "browser_download_url": "old", "size": 1}]},
         ]);
         let releases = parse_releases(&list, Some(asset), is_game_tag);
-        assert!(releases.iter().all(|r| r.tag != "v2026.10.15.1"));
+        assert!(releases.iter().all(|r| r.tag != "26.3-0.1.2"));
         assert_eq!(
             latest(&releases).map(|r| r.tag.as_str()),
-            Some("v2026.10.15")
+            Some("26.3-0.1.1")
         );
         let offered = |installed: &[&str]| {
             let installed: Vec<String> = installed.iter().map(|t| t.to_string()).collect();
-            sunrise_update(&releases, &installed).map(|r| r.tag)
+            sunrise_update(&releases, &installed, crate::instances::Channel::Stable)
+                .map(|r| r.tag.clone())
         };
-        assert_eq!(offered(&["v2026.10.14"]), Some("v2026.10.15".into()));
-        assert_eq!(offered(&[]), Some("v2026.10.15".into()));
+        assert_eq!(offered(&["26.3-0.1.0"]), Some("26.3-0.1.1".into()));
+        assert_eq!(offered(&[]), Some("26.3-0.1.1".into()));
         // Who installed the withdrawn one is not told to "update" to an older version.
-        assert_eq!(offered(&["v2026.10.15.1", "v2026.10.14"]), None);
-    }
-
-    /// Every release is published as the release, and launchers update to it. The pre-releases
-    /// of the old Alpha channel (v0.2.1 on) are only installed by hand: a launcher that
-    /// had one installed waits for the next release instead of going back.
-    #[test]
-    fn updates_follow_every_release_and_leave_the_old_alpha_ones_out() {
-        let asset = ASSET.unwrap_or("sunrise-linux-x86_64.tar.gz");
-        let list = serde_json::json!([
-            {"tag_name": "v0.2.13", "assets": [{"name": asset, "browser_download_url": "n", "size": 1}]},
-            {"tag_name": "v0.2.12", "prerelease": true, "assets": [{"name": asset, "browser_download_url": "a", "size": 1}]},
-            {"tag_name": "v0.2.0", "assets": [{"name": asset, "browser_download_url": "s", "size": 1}]},
-        ]);
-        let releases = parse_releases(&list, Some(asset), is_game_tag);
-        assert_eq!(
-            releases.iter().map(|r| r.prerelease).collect::<Vec<_>>(),
-            [false, true, false]
-        );
-        let offered = |releases: &[Release], installed: &[&str]| {
-            let installed: Vec<String> = installed.iter().map(|t| t.to_string()).collect();
-            sunrise_update(&installable_updates(releases), &installed).map(|r| r.tag)
-        };
-        assert_eq!(offered(&releases, &[]), Some("v0.2.13".into()));
-        assert_eq!(offered(&releases, &["v0.2.0"]), Some("v0.2.13".into()));
-        assert_eq!(offered(&releases, &["v0.2.12"]), Some("v0.2.13".into()));
-        assert_eq!(offered(&releases, &["v0.2.13"]), None);
-        // Before the first release of the single channel: the old Alpha one stays where it is.
-        let before = &releases[1..];
-        assert_eq!(offered(before, &["v0.2.0"]), None);
-        assert_eq!(offered(before, &["v0.2.12", "v0.2.0"]), None);
-        assert_eq!(CHECK_EVERY.as_secs(), 30 * 60);
+        assert_eq!(offered(&["26.3-0.1.2", "26.3-0.1.0"]), None);
     }
 
     #[test]
@@ -6181,39 +6021,6 @@ pub fn {f}("
             parse_version_output(&format!("{}{VERSION}\n", crate::identity::VERSION_PREFIX)),
             Some(VERSION)
         );
-    }
-
-    #[test]
-    fn an_older_nightly_installs_as_a_rollback_with_a_warning() {
-        let nightly = |tag: &str| Release {
-            tag: tag.into(),
-            name: String::new(),
-            body: String::new(),
-            date: String::new(),
-            time: String::new(),
-            asset: Some(("u".into(), 1)),
-            prerelease: false,
-            nightly: Some("nightly".into()),
-        };
-        let installed = [
-            "v0.2.81".to_owned(),
-            "nightly-2026-10-28-0c02067".to_owned(),
-        ];
-        let warning =
-            nightly_downgrade(&nightly("nightly-2026-10-21-aaaaaaa"), &installed).unwrap();
-        assert!(
-            warning.contains("older than nightly-2026-10-28-0c02067"),
-            "{warning}"
-        );
-        assert!(nightly_downgrade(&nightly("nightly-2026-10-29-bbbbbbb"), &installed).is_none());
-        assert!(nightly_downgrade(&nightly("nightly-2026-10-28-0c02067"), &installed).is_none());
-        // No Nightly installed, or a release: nothing to warn about.
-        assert!(
-            nightly_downgrade(&nightly("nightly-2026-10-21-aaaaaaa"), &installed[..1]).is_none()
-        );
-        let mut release = nightly("v0.2.80");
-        release.nightly = None;
-        assert!(nightly_downgrade(&release, &installed).is_none());
     }
 
     #[test]
@@ -6485,7 +6292,7 @@ pub fn {f}("
     }
 
     #[test]
-    fn game_0_2_follows_every_date_release() {
+    fn launcher_semver_and_historical_order_stay_the_same() {
         assert_eq!(compare_versions("v0.2.0", "v2026.10.19.15"), Greater);
         assert_eq!(compare_versions("v0.2.0", "v2026.10.21"), Greater);
         assert_eq!(compare_versions("v2099.12.31.9", "v0.2.0"), Less);
@@ -6501,40 +6308,12 @@ pub fn {f}("
         assert_eq!(compare_versions("v0.3.0-beta.1", "v0.3.0-beta"), Greater);
         assert_eq!(compare_versions("v0.3.0-alpha", "v0.3.0-1"), Greater);
         assert_eq!(compare_versions("v0.2.1-beta.1", "v2026.10.21"), Greater);
-        // Launcher and game tags of 0.2 compare alike; old launcher tags stay below.
+        // The two launcher tag eras still compare in the same order.
         assert_eq!(
             compare_versions("launcher@0.2.0", "launcher-v0.16.0"),
             Greater
         );
         assert_eq!(compare_versions("launcher@0.2.0", "v0.2.0"), Equal);
-
-        let asset = ASSET.unwrap_or("sunrise-linux-x86_64.tar.gz");
-        let list = serde_json::json!([
-            {"tag_name": "v0.2.0", "prerelease": true, "assets": [{"name": asset, "browser_download_url": "b", "size": 1}]},
-            {"tag_name": "v2026.10.21", "prerelease": true, "assets": [{"name": asset, "browser_download_url": "d", "size": 1}]},
-            {"tag_name": "v2026.10.19.15", "assets": [{"name": asset, "browser_download_url": "s", "size": 1}]},
-        ]);
-        let releases = parse_releases(&list, Some(asset), is_game_tag);
-        let installed = ["v2026.10.19.15".to_string(), "v2026.10.12".to_string()];
-        // A pre-release 0.2.0 is not an update; once published as the release, it is one.
-        let offered = |releases: &[Release]| {
-            sunrise_update(&installable_updates(releases), &installed).map(|r| r.tag)
-        };
-        assert_eq!(offered(&releases), None);
-        let mut released = releases.clone();
-        released[0].prerelease = false;
-        assert_eq!(offered(&released), Some("v0.2.0".into()));
-        let mut sorted = vec![
-            "v2026.10.19.15".to_string(),
-            "v0.2.1".into(),
-            "v0.2.0".into(),
-            "v2026.10.21".into(),
-        ];
-        sorted.sort_by(|a, b| compare_versions(b, a));
-        assert_eq!(
-            sorted,
-            ["v0.2.1", "v0.2.0", "v2026.10.21", "v2026.10.19.15"]
-        );
     }
 
     #[test]
@@ -6587,7 +6366,7 @@ pub fn {f}("
     }
 
     #[test]
-    fn updates() {
+    fn launcher_updates_from_earlier_launcher_tags() {
         let r = |tag: &str| Release {
             tag: tag.into(),
             name: String::new(),
@@ -6598,137 +6377,68 @@ pub fn {f}("
             prerelease: false,
             nightly: None,
         };
-        let releases = [r("v2026.10.13"), r("v2026.10.12")];
-        assert_eq!(
-            sunrise_update(&releases, &["v2026.10.12".into()]).map(|r| r.tag),
-            Some("v2026.10.13".into())
-        );
-        assert!(sunrise_update(&releases, &["v2026.10.13".into()]).is_none());
         assert!(launcher_update(&[r("launcher-v0.0.1")]).is_none());
         assert!(launcher_update(&[r("launcher@99.0.0")]).is_some());
         assert!(launcher_update_from(&[r("launcher-v99.0.0")], "launcher-v0.16.0").is_some());
-        let installed = ["v2026.10.12".to_string(), "v2026.10.1".to_string()];
-        assert!(select_after_update(Some("v2026.10.12"), &installed));
-        assert!(!select_after_update(Some("v2026.10.1"), &installed));
-        assert!(select_after_update(None, &installed));
-        // A Nightly follows updates only from the newest one: an older pick is a rollback.
-        let nightlies = [
-            "nightly-2026-11-11-bbbbbbb".to_string(),
-            "nightly-2026-11-10-aaaaaaa".to_string(),
-        ];
-        assert!(select_after_update(
-            Some("nightly-2026-11-11-bbbbbbb"),
-            &nightlies
-        ));
-        assert!(!select_after_update(
-            Some("nightly-2026-11-10-aaaaaaa"),
-            &nightlies
-        ));
-        assert!(!select_after_update(Some("developer-abc"), &[]));
-        assert!(!select_after_update(Some("developer-abc"), &installed));
-        assert!(!select_after_update(
-            Some("imported-2026-11-01-abcdef0"),
-            &["imported-2026-11-01-abcdef0".to_string()]
-        ));
     }
 
-    /// The Nightly is the only build Sunrise ships (docs/release-flow.md): every launcher takes the
-    /// current one as its update, over every release; the last week's are listed, never offered.
     #[test]
-    fn every_launcher_updates_to_the_current_nightly() {
-        let asset = ASSET.unwrap_or("sunrise-linux-x86_64.tar.gz");
-        let build = |url: &str| serde_json::json!([{"name": asset, "browser_download_url": url, "size": 1}]);
-        let list = serde_json::json!([
-            {"tag_name": "nightly", "name": "Nightly 2026-10-28 · 9b772b2", "prerelease": true,
-             "published_at": "2026-10-28T09:58:01Z", "assets": build("n")},
-            {"tag_name": "launcher@0.2.21", "assets": []},
-            {"tag_name": "v0.2.95", "assets": build("r")},
-            {"tag_name": "nightly-2026-10-28", "name": "Nightly 2026-10-28 · 83f15fa", "prerelease": true,
-             "published_at": "2026-10-28T07:54:57Z", "assets": build("d")},
-            {"tag_name": "nightly-2026-10-27", "name": "Nightly 2026-10-27 · 7954902", "prerelease": true,
-             "published_at": "2026-10-28T00:15:40Z", "assets": build("e")},
-        ]);
-        let releases = game_releases(&list);
-        let listed: Vec<_> = releases
-            .iter()
-            .map(|r| (r.tag.as_str(), r.nightly.as_deref(), r.prerelease))
-            .collect();
+    fn published_builds_and_updates_are_channel_scoped() {
+        use crate::instances::Channel::{Nightly, Stable};
+        let asset = "sunrise-linux-x86_64.tar.gz";
+        let files = serde_json::json!([{"name": asset, "size": 1}]);
+        let releases = game_releases_with(
+            &serde_json::json!([
+                {"tag_name": "nightly", "name": "Nightly 2026-11-20 · aaaaaaa", "prerelease": true, "assets": files},
+                {"tag_name": "nightly-2026-11-19", "assets": files},
+                {"tag_name": "v2026.10.13", "assets": files},
+                {"tag_name": "v1.0.0", "assets": files},
+                {"tag_name": "launcher@0.2.21", "assets": files},
+                {"tag_name": "26.3-0.1.0", "assets": files},
+                {"tag_name": "26.3-0.1.2", "prerelease": true, "assets": files},
+                {"tag_name": "26.3-0.1.3-rc.1", "assets": files},
+                {"tag_name": "26.3-0.1.4", "draft": true, "assets": files},
+                {"tag_name": "26.3-0.1.1", "assets": files},
+            ]),
+            Some(asset),
+            None,
+        );
+        let nightly = "nightly-2026-11-20-aaaaaaa";
         assert_eq!(
-            listed,
-            [
-                ("nightly-2026-10-28-9b772b2", Some("nightly"), false),
-                (
-                    "nightly-2026-10-28-83f15fa",
-                    Some("nightly-2026-10-28"),
-                    true
-                ),
-                (
-                    "nightly-2026-10-27-7954902",
-                    Some("nightly-2026-10-27"),
-                    true
-                ),
-                ("v0.2.95", None, false),
-            ]
+            releases.iter().map(|r| r.tag.as_str()).collect::<Vec<_>>(),
+            [nightly, "26.3-0.1.1", "26.3-0.1.0"]
         );
-        let offered = |installed: &[&str]| {
-            let installed: Vec<String> = installed.iter().map(|t| t.to_string()).collect();
-            sunrise_update(&installable_updates(&releases), &installed).map(|r| r.tag)
+        assert_eq!(
+            releases[1].asset.as_ref().unwrap().0,
+            format!("https://github.com/sunrise-org/sunrise/releases/download/26.3-0.1.1/{asset}")
+        );
+        let offered = |catalogue: &[Release], installed: &[&str], channel| {
+            let installed = installed.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            sunrise_update(catalogue, &installed, channel).map(|r| r.tag.clone())
         };
-        let current = Some("nightly-2026-10-28-9b772b2".to_string());
-        // A player of the release channel, a new player, one on an older Nightly of the same day.
-        assert_eq!(offered(&["v0.2.95", "v0.2.94"]), current);
-        assert_eq!(offered(&[]), current);
-        assert_eq!(offered(&["nightly-2026-10-28-83f15fa", "v0.2.95"]), current);
-        assert_eq!(offered(&["nightly-2026-10-28-9b772b2"]), None);
-        // Nightlies come after every release in every list.
-        assert!(compare_versions("nightly-2026-10-27-7954902", "v0.2.95").is_gt());
-        assert!(
-            compare_versions("nightly-2026-10-28-9b772b2", "nightly-2026-10-27-7954902").is_gt()
+        assert_eq!(
+            offered(&releases, &[nightly, "26.3-0.1.0"], Stable),
+            Some("26.3-0.1.1".into())
         );
-    }
-
-    /// Players move to the Nightly at their next check: whoever was on the newest release, on a
-    /// Nightly, or on nothing. A release picked by hand stays picked.
-    #[test]
-    fn players_of_the_newest_release_move_to_the_nightly() {
-        let installed = [
-            "nightly-2026-10-27-7954902".to_string(),
-            "v0.2.95".into(),
-            "v0.2.90".into(),
-        ];
-        assert!(select_after_update(Some("v0.2.95"), &installed));
-        assert!(select_after_update(
-            Some("nightly-2026-10-27-7954902"),
-            &installed
-        ));
-        assert!(select_after_update(None, &installed));
-        assert!(!select_after_update(Some("v0.2.90"), &installed));
-        assert!(select_after_update(
-            Some("v0.2.95"),
-            &["v0.2.95".to_string()]
-        ));
-    }
-
-    #[test]
-    fn new_versions_install_automatically_unless_turned_off() {
-        // No settings file, an old one that never mentioned it, and 0.1.1's default `false`.
-        assert!(Settings::parse("").auto_install());
-        assert!(Settings::parse("{}").auto_install());
-        assert!(
-            Settings::parse(r#"{"selected": "v2026.10.13", "auto_install": false}"#).auto_install()
+        assert_eq!(
+            offered(
+                &releases,
+                &["26.3-0.1.1", "nightly-2026-11-20-bbbbbbb"],
+                Nightly
+            ),
+            Some(nightly.into())
         );
-        assert!(Settings::parse(r#"{"install_new_versions": true}"#).auto_install());
-        assert!(!Settings::parse(r#"{"install_new_versions": false}"#).auto_install());
-        // Saving after the player turned it off keeps it off.
-        let off = Settings {
-            install_new_versions: Some(false),
-            ..Settings::default()
-        };
-        assert!(!Settings::parse(&serde_json::to_string(&off).unwrap()).auto_install());
-        // The selection rule is unchanged: the new version is selected only from the newest.
-        let installed = ["v2026.10.12".to_string(), "v2026.10.1".to_string()];
-        assert!(select_after_update(Some("v2026.10.12"), &installed));
-        assert!(!select_after_update(Some("v2026.10.1"), &installed));
+        assert_eq!(offered(&releases, &[nightly, "26.3-0.1.1"], Stable), None);
+        assert_eq!(offered(&releases[..1], &["26.3-0.1.0"], Stable), None);
+        assert_eq!(
+            offered(&releases[1..], &["nightly-2026-11-19-aaaaaaa"], Nightly),
+            None
+        );
+        assert_eq!(
+            offered(&releases, &["nightly-2026-11-21-aaaaaaa"], Nightly),
+            None
+        );
+        assert_eq!(offered(&releases, &["26.4-0.1.0"], Stable), None);
     }
 
     #[test]
@@ -7488,16 +7198,21 @@ esac"#
     fn pruning_keeps_the_newest_and_the_protected() {
         let tags = |t: &[&str]| t.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let installed = tags(&[
-            "v0.2.91", "v0.2.90", "v0.2.88", "v0.2.85", "v0.2.80", "nightly",
+            "26.3-0.1.91",
+            "26.3-0.1.90",
+            "26.3-0.1.88",
+            "26.3-0.1.85",
+            "26.3-0.1.80",
+            "nightly",
         ]);
         assert_eq!(
-            stale_versions(&installed, 2, &tags(&["v0.2.85"]), |_| false),
-            tags(&["v0.2.88", "v0.2.80"])
+            stale_versions(&installed, 2, &tags(&["26.3-0.1.85"]), |_| false),
+            tags(&["26.3-0.1.88", "26.3-0.1.80"])
         );
         // A protected version among the newest still leaves the newest `keep` in place.
         assert_eq!(
-            stale_versions(&installed, 2, &tags(&["v0.2.91"]), |_| false),
-            tags(&["v0.2.88", "v0.2.85", "v0.2.80"])
+            stale_versions(&installed, 2, &tags(&["26.3-0.1.91"]), |_| false),
+            tags(&["26.3-0.1.88", "26.3-0.1.85", "26.3-0.1.80"])
         );
         assert!(stale_versions(&installed, 9, &[], |_| false).is_empty());
     }
@@ -7545,14 +7260,14 @@ esac"#
             "imported-2026-11-05-abcdef0",
             "nightly-2026-11-05-f319701",
             "nightly-2026-11-04-6475f62",
-            "v0.2.91",
-            "v0.2.90",
+            "26.3-0.1.91",
+            "26.3-0.1.90",
         ]
         .map(String::from);
         assert!(stale_versions(&installed, 2, &[], |_| true).is_empty());
         assert_eq!(
             stale_versions(&installed, 1, &[], |_| true),
-            ["nightly-2026-11-04-6475f62", "v0.2.90"]
+            ["nightly-2026-11-04-6475f62", "26.3-0.1.90"]
         );
     }
 
